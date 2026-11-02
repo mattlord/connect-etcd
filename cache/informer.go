@@ -115,14 +115,15 @@ func streamHeaderCanceledError(reason string, compactedRevision, startRevision i
 
 const defaultPageSize = 100
 
+// load lists the keys at the current revision into a new cache, and swaps it
+// for the old one. It calls AddFunc, UpdateFunc and DeleteFunc, in no
+// particular order, for the differences between the two, so that consumers
+// end up with the new cache, and the watch continues from the listed revision.
 func (i *Informer) load(ctx context.Context) error {
-	i.cacheLock.Lock()
-
 	l := i.Client.Logger()
 
-	i.cache = make(map[string]*mvccpb.KeyValue)
-	i.lastRevision.Store(0)
-	i.totalKeys = 0
+	start := time.Now()
+	cache := make(map[string]*mvccpb.KeyValue)
 
 	pageSize := i.ListPageSize
 	if pageSize == 0 {
@@ -168,7 +169,6 @@ func (i *Informer) load(ctx context.Context) error {
 			Serializable: serializable,
 		}))
 		if err != nil {
-			i.cacheLock.Unlock()
 			return err
 		}
 		msg := resp.Msg
@@ -178,7 +178,7 @@ func (i *Informer) load(ctx context.Context) error {
 		}
 
 		for _, kv := range msg.Kvs {
-			i.cache[string(kv.Key)] = kv
+			cache[string(kv.Key)] = kv
 		}
 
 		if !msg.More {
@@ -188,12 +188,40 @@ func (i *Informer) load(ctx context.Context) error {
 		startKey = nextKey(msg.Kvs[len(msg.Kvs)-1].Key)
 	}
 
-	i.lastRevision.Store(lastRevision)
-	i.cacheLock.Unlock()
+	// Swap the caches and send out the differences under the lock, as the
+	// watch does, so that readers never see the new cache before the
+	// callbacks have.
+	i.cacheLock.Lock()
+	defer i.cacheLock.Unlock()
 
-	// send out the AddFunc calls after we've successfully synced
-	for _, kv := range i.cache {
-		i.addFunc(kv)
+	old := i.cache
+	i.cache = cache
+	i.lastRevision.Store(lastRevision)
+
+	for key, kv := range cache {
+		prev, ok := old[key]
+		switch {
+		case !ok:
+			i.addFunc(kv)
+		case prev.ModRevision != kv.ModRevision:
+			i.updateFunc(kv)
+		}
+	}
+	for key, kv := range old {
+		if _, ok := cache[key]; !ok {
+			// Like a watch's DELETE event, pass only the key and a
+			// revision at which it was deleted.
+			i.deleteFunc(&mvccpb.KeyValue{Key: kv.Key, ModRevision: lastRevision})
+		}
+	}
+
+	if l.CheckInfo() {
+		l.Info(
+			"informer sync finished",
+			"total_keys", i.totalKeys,
+			"revision", lastRevision,
+			"duration", time.Since(start),
+		)
 	}
 
 	return nil
@@ -222,30 +250,32 @@ func (i *Informer) Run(ctx context.Context) error {
 
 	l := i.Client.Logger()
 
-	start := time.Now()
-
 	if err := i.load(ctx); err != nil {
 		i.syncDone <- err
 		close(i.syncDone)
 		return err
 	}
 
-	if l.CheckInfo() {
-		l.Info(
-			"informer sync finished",
-			"total_keys", i.totalKeys,
-			"revision", i.lastRevision.Load(),
-			"duration", time.Since(start),
-		)
-	}
-
 	close(i.syncDone)
 
 	// we explicitly want the stream to retry forever reconnecting
 	// outside of the Unary interceptor retry intervals
+	resync := false
 	return retry.Forever(ctx, l,
 		1*time.Second, 0.5,
-		func() error { return i.stream(ctx) },
+		func() error {
+			// etcd has compacted the revision that the watch would
+			// resume from, so list the keys again and watch from there.
+			if resync {
+				if err := i.load(ctx); err != nil {
+					return err
+				}
+			}
+			err := i.stream(ctx)
+			var compacted *CompactedError
+			resync = errors.As(err, &compacted)
+			return err
+		},
 	)
 }
 
@@ -325,6 +355,16 @@ func (i *Informer) stream(ctx context.Context) error {
 			}
 
 			if msg.Canceled {
+				// etcd confirms a watch that starts at a compacted
+				// revision, then cancels it in a later message.
+				if msg.CompactRevision != 0 {
+					errCh <- &CompactedError{
+						Reason:            msg.CancelReason,
+						CompactedRevision: msg.CompactRevision,
+						RequestedRevision: startRevision,
+					}
+					return
+				}
 				errCh <- fmt.Errorf("informer: stream canceled: %q", msg.CancelReason)
 				return
 			}
@@ -351,10 +391,11 @@ func (i *Informer) stream(ctx context.Context) error {
 				i.cacheLock.Lock()
 				switch event.Type {
 				case mvccpb.Event_PUT:
-					if _, ok := i.cache[string(event.Kv.Key)]; ok {
+					_, ok := i.cache[string(event.Kv.Key)]
+					i.cache[string(event.Kv.Key)] = event.Kv
+					if ok {
 						i.updateFunc(event.Kv)
 					} else {
-						i.cache[string(event.Kv.Key)] = event.Kv
 						i.addFunc(event.Kv)
 					}
 				case mvccpb.Event_DELETE:

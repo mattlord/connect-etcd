@@ -2,8 +2,12 @@ package cache
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	etcd "go.withmatt.com/connect-etcd"
 	"go.withmatt.com/connect-etcd/types/etcdserverpb"
 	"go.withmatt.com/connect-etcd/types/etcdserverpb/etcdserverpbconnect"
+	"go.withmatt.com/connect-etcd/types/mvccpb"
 )
 
 // fakeWatchHandler stubs only Watch; the embedded nil interface panics if
@@ -126,4 +131,189 @@ func startFakeWatchCancelingEtcd(t *testing.T, release <-chan struct{}) (string,
 	})
 
 	return srv.Listener.Addr().String(), watchCanceled
+}
+
+// fakeKVHandler stubs only Range; the embedded nil interface panics if
+// anything else is called.
+type fakeKVHandler struct {
+	etcdserverpbconnect.KVHandler
+	rangeFunc func(context.Context, *connect.Request[etcdserverpb.RangeRequest]) (*connect.Response[etcdserverpb.RangeResponse], error)
+}
+
+func (f *fakeKVHandler) Range(ctx context.Context, req *connect.Request[etcdserverpb.RangeRequest]) (*connect.Response[etcdserverpb.RangeResponse], error) {
+	return f.rangeFunc(ctx, req)
+}
+
+// TestInformerResyncsAfterCompaction ensures that when etcd has compacted the
+// revision that the watch would resume from, Run lists the keys again until a
+// list succeeds, sends the changes that it missed, and watches from the listed
+// revision.
+func TestInformerResyncsAfterCompaction(t *testing.T) {
+	t.Parallel()
+
+	kv := func(key string, modRevision int64) *mvccpb.KeyValue {
+		return &mvccpb.KeyValue{Key: []byte(key), ModRevision: modRevision}
+	}
+
+	// The fake etcd starts with a, b and c at revision 10. When the first
+	// watch starts, it has missed an update to b, the deletion of c and the
+	// addition of d, and revision 18 has been compacted. The first list after
+	// that fails.
+	var mu sync.Mutex
+	kvs := []*mvccpb.KeyValue{kv("a", 2), kv("b", 3), kv("c", 4)}
+	revision := int64(10)
+	var rangeCalls int
+	var watchStarts []int64
+
+	kvPath, kvHandler := etcdserverpbconnect.NewKVHandler(&fakeKVHandler{
+		rangeFunc: func(ctx context.Context, req *connect.Request[etcdserverpb.RangeRequest]) (*connect.Response[etcdserverpb.RangeResponse], error) {
+			mu.Lock()
+			defer mu.Unlock()
+			rangeCalls++
+			if rangeCalls == 2 {
+				return nil, connect.NewError(connect.CodeUnavailable, errors.New("etcd is unavailable"))
+			}
+			return connect.NewResponse(&etcdserverpb.RangeResponse{
+				Header: &etcdserverpb.ResponseHeader{Revision: revision},
+				Kvs:    kvs,
+			}), nil
+		},
+	})
+	watchPath, watchHandler := etcdserverpbconnect.NewWatchHandler(&fakeWatchHandler{
+		watch: func(ctx context.Context, stream *connect.BidiStream[etcdserverpb.WatchRequest, etcdserverpb.WatchResponse]) error {
+			req, err := stream.Receive()
+			if err != nil {
+				return err
+			}
+			create := req.GetCreateRequest()
+
+			mu.Lock()
+			watchStarts = append(watchStarts, create.StartRevision)
+			if len(watchStarts) == 1 {
+				kvs = []*mvccpb.KeyValue{kv("a", 2), kv("b", 15), kv("d", 16)}
+				revision = 20
+			}
+			header := &etcdserverpb.ResponseHeader{Revision: revision}
+			mu.Unlock()
+
+			if err := stream.Send(&etcdserverpb.WatchResponse{
+				WatchId: create.WatchId,
+				Created: true,
+				Header:  header,
+			}); err != nil {
+				return err
+			}
+
+			resp := &etcdserverpb.WatchResponse{
+				WatchId: create.WatchId,
+				Header:  header,
+			}
+			if create.StartRevision < 18 {
+				// Like etcd, cancel the watch in a second message.
+				resp.Canceled = true
+				resp.CompactRevision = 18
+			} else {
+				resp.Header = &etcdserverpb.ResponseHeader{Revision: 22}
+				resp.Events = []*mvccpb.Event{
+					{Type: mvccpb.Event_PUT, Kv: kv("b", 21)},
+					{Type: mvccpb.Event_DELETE, Kv: kv("a", 22)},
+				}
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+
+	mux := http.NewServeMux()
+	mux.Handle(kvPath, kvHandler)
+	mux.Handle(watchPath, watchHandler)
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	t.Cleanup(srv.Close)
+
+	var eventsMu sync.Mutex
+	var events []string
+	deletedA := make(chan struct{})
+	record := func(op string) func(*mvccpb.KeyValue) {
+		return func(kv *mvccpb.KeyValue) {
+			eventsMu.Lock()
+			defer eventsMu.Unlock()
+			events = append(events, fmt.Sprintf("%s %s@%d", op, kv.Key, kv.ModRevision))
+			if op == "delete" && string(kv.Key) == "a" {
+				close(deletedA)
+			}
+		}
+	}
+	inf := &Informer{
+		// Don't let the client retry the failed list itself.
+		Client: etcd.NewClient(etcd.Config{
+			Endpoints:    []string{srv.Listener.Addr().String()},
+			RetryOptions: etcd.NoRetry,
+		}),
+		Key:        []byte("a"),
+		RangeEnd:   []byte("z"),
+		AddFunc:    record("add"),
+		UpdateFunc: record("update"),
+		DeleteFunc: record("delete"),
+	}
+
+	// Make sure the test doesn't take forever.
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- inf.Run(ctx) }()
+	select {
+	case <-deletedA:
+	case <-ctx.Done():
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		t.Fatalf("watch events never arrived (%v); events: %q", ctx.Err(), events)
+	}
+	cancel()
+	if err := <-runErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+	}
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	// Each sync sends its events in map order.
+	want := [][]string{
+		{"add a@2", "add b@3", "add c@4"},
+		{"add d@16", "delete c@20", "update b@15"},
+		{"update b@21", "delete a@22"},
+	}
+	if len(events) != 8 {
+		t.Fatalf("events = %q, want %q", events, want)
+	}
+	got := [][]string{events[:3], events[3:6], events[6:]}
+	slices.Sort(got[0])
+	slices.Sort(got[1])
+	for n := range want {
+		if !slices.Equal(got[n], want[n]) {
+			t.Fatalf("events = %q, want %q", got, want)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if rangeCalls != 3 {
+		t.Errorf("Range calls = %d, want 3", rangeCalls)
+	}
+	if want := []int64{11, 21}; !slices.Equal(watchStarts, want) {
+		t.Errorf("watch start revisions = %v, want %v", watchStarts, want)
+	}
+
+	for key, want := range map[string]int64{"a": 0, "b": 21, "c": 0, "d": 16} {
+		kv, ok := inf.Get([]byte(key))
+		switch {
+		case want == 0 && ok:
+			t.Errorf("Get(%q) = %v, want no key", key, kv)
+		case want != 0 && (!ok || kv.ModRevision != want):
+			t.Errorf("Get(%q) = %v, %v, want revision %d", key, kv, ok, want)
+		}
+	}
 }
