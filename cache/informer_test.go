@@ -294,14 +294,19 @@ func TestInformerRun(t *testing.T) {
 		return func(kv *mvccpb.KeyValue) {
 			event := fmt.Sprintf("%s %s@%d", op, kv.Key, kv.ModRevision)
 			// Step 1's callbacks, the only ones for revisions before the
-			// first list's 10, can read the cache, which already holds
-			// their keys. Every later callback runs with the cache locked.
+			// first list's 10, can read the cache, which already holds the
+			// whole list. Every later callback runs with the cache locked.
 			// Check before taking eventsMu, so that a callback stuck on
 			// the cache lock doesn't keep the test from failing.
 			var callbackErr string
 			if kv.ModRevision < 10 {
-				if got, ok := inf.Get(kv.Key); !ok || got.ModRevision != kv.ModRevision {
-					callbackErr = fmt.Sprintf("%s: Get = %v, %v", event, got, ok)
+				var keys []string
+				for _, key := range inf.List() {
+					keys = append(keys, string(key))
+				}
+				slices.Sort(keys)
+				if want := []string{"a", "b", "c"}; !slices.Equal(keys, want) {
+					callbackErr = fmt.Sprintf("%s: List = %q, want %q", event, keys, want)
 				}
 			} else if inf.cacheLock.TryRLock() {
 				inf.cacheLock.RUnlock()
