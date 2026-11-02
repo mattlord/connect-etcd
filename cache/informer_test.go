@@ -160,14 +160,27 @@ func TestInformerRun(t *testing.T) {
 		return &mvccpb.KeyValue{Key: []byte(key), ModRevision: modRevision}
 	}
 
-	// The fake etcd starts with a, b and c at revision 10. When the first
-	// watch starts, it has missed an update to b, the deletion of c and the
-	// addition of d, and revision 18 has been compacted. The first list after
-	// that fails.
+	// The fake etcd plays out this history of keys a to d:
 	//
-	// Like etcd, it sends the changes after the list to a watch that is
-	// behind in batches, each with its current revision, 25. The connection
-	// of the first watch after the list drops after the first batch.
+	//  1. The first list, at revision 10, finds a@2, b@3 and c@4, so Run
+	//     adds all three and watches from 11.
+	//  2. Before that watch starts, b is updated at 15, d is added at 16, c
+	//     is deleted at 17, and etcd compacts at revision 18. So etcd
+	//     cancels the watch, and Run lists the keys again.
+	//  3. That list fails, so Run tries again.
+	//  4. The next list, at revision 20, finds a@2, b@15 and d@16. Run
+	//     updates b, adds d, and deletes c at the list's revision, 20, since
+	//     the list can't tell when c was deleted. It sends nothing for a,
+	//     which hasn't changed, and watches from 21.
+	//  5. Meanwhile b is updated at 21, d at 22, and a is deleted at 23, and
+	//     etcd is at revision 25. It sends the watch these changes in two
+	//     batches, with 25 in each one's header: first b and d, then a. The
+	//     connection drops after the first batch.
+	//  6. Run watches again from 23, after the last event it received
+	//     rather than after the header's 25, so it gets the deletion of a.
+	//  7. The test cancels Run, which must leave no watch goroutine behind.
+	//
+	// Step 5's batches.
 	batches := [][]*mvccpb.Event{
 		{{Type: mvccpb.Event_PUT, Kv: kv("b", 21)}, {Type: mvccpb.Event_PUT, Kv: kv("d", 22)}},
 		{{Type: mvccpb.Event_DELETE, Kv: kv("a", 23)}},
@@ -183,6 +196,7 @@ func TestInformerRun(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			rangeCalls++
+			// Step 3: the second list fails.
 			if rangeCalls == 2 {
 				return nil, connect.NewError(connect.CodeUnavailable, errors.New("etcd is unavailable"))
 			}
@@ -204,6 +218,8 @@ func TestInformerRun(t *testing.T) {
 			watchStarts = append(watchStarts, create.StartRevision)
 			watches := len(watchStarts)
 			if watches == 1 {
+				// Step 2: etcd's keys change before the first watch
+				// starts.
 				kvs = []*mvccpb.KeyValue{kv("a", 2), kv("b", 15), kv("d", 16)}
 				revision = 20
 			}
@@ -219,7 +235,8 @@ func TestInformerRun(t *testing.T) {
 			}
 
 			if create.StartRevision < 18 {
-				// Like etcd, cancel the watch in a second message.
+				// Step 2: etcd has compacted the start revision, so like
+				// etcd, cancel the watch in a second message.
 				if err := stream.Send(&etcdserverpb.WatchResponse{
 					WatchId:         create.WatchId,
 					Header:          header,
@@ -229,6 +246,9 @@ func TestInformerRun(t *testing.T) {
 					return err
 				}
 			} else {
+				// Steps 5 and 6: send the events from the start revision
+				// on, and drop the second watch's connection after its
+				// first batch.
 				for _, batch := range batches {
 					var events []*mvccpb.Event
 					for _, ev := range batch {
@@ -277,7 +297,8 @@ func TestInformerRun(t *testing.T) {
 		}
 	}
 	inf := &Informer{
-		// Don't let the client retry the failed list itself.
+		// Don't let the client retry step 3's failed list itself, so that
+		// Run sees the failure.
 		Client: etcd.NewClient(etcd.Config{
 			Endpoints:    []string{srv.Listener.Addr().String()},
 			RetryOptions: etcd.NoRetry,
@@ -293,6 +314,7 @@ func TestInformerRun(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
+	// Wait for the last change, step 6's deletion of a.
 	runErr := make(chan error, 1)
 	go func() { runErr <- inf.Run(ctx) }()
 	select {
@@ -302,6 +324,8 @@ func TestInformerRun(t *testing.T) {
 		defer eventsMu.Unlock()
 		t.Fatalf("watch events never arrived (%v); events: %q", ctx.Err(), events)
 	}
+	// Step 7. The check finds the watch goroutine by its function's name,
+	// so first make sure that it finds it while the watch runs.
 	watching := func() (bool, string) {
 		buf := make([]byte, 1<<20)
 		stacks := string(buf[:runtime.Stack(buf, true)])
@@ -326,10 +350,15 @@ func TestInformerRun(t *testing.T) {
 
 	eventsMu.Lock()
 	defer eventsMu.Unlock()
-	// Each sync sends its events in map order.
+	// Each list sends its events in map order, so sort those.
 	want := [][]string{
+		// Step 1: the first list adds every key.
 		{"add a@2", "add b@3", "add c@4"},
+		// Step 4: the second successful list adds d, deletes c and
+		// updates b, but sends nothing for a.
 		{"add d@16", "delete c@20", "update b@15"},
+		// Steps 5 and 6: the watch updates b and d, then deletes a, each
+		// once, in order.
 		{"update b@21", "update d@22", "delete a@23"},
 	}
 	if len(events) != 9 {
@@ -346,13 +375,18 @@ func TestInformerRun(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+	// Steps 1, 3 and 4. The dropped connection doesn't list again.
 	if rangeCalls != 3 {
 		t.Errorf("Range calls = %d, want 3", rangeCalls)
 	}
+	// After step 1's list, after step 4's, and in step 6 after the last
+	// event received.
 	if want := []int64{11, 21, 23}; !slices.Equal(watchStarts, want) {
 		t.Errorf("watch start revisions = %v, want %v", watchStarts, want)
 	}
 
+	// After step 6, the cache matches etcd: a and c are gone, and b and d
+	// are at their latest revisions.
 	for key, want := range map[string]int64{"a": 0, "b": 21, "c": 0, "d": 22} {
 		kv, ok := inf.Get([]byte(key))
 		switch {
