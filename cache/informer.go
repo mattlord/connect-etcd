@@ -406,7 +406,16 @@ func (i *Informer) stream(ctx context.Context) error {
 			}
 
 			lastRevision = msg.Header.Revision
-			i.lastRevision.Store(lastRevision)
+			// etcd sends a watch that is behind in batches of up to 1000
+			// revisions, each with its current revision. Resume after the
+			// last event rather than the header's revision, in case the
+			// rest of the batches never arrive. This relies on the watch
+			// not asking for fragments, which can split a revision.
+			resumeRevision := lastRevision
+			if n := len(msg.Events); n > 0 {
+				resumeRevision = msg.Events[n-1].Kv.ModRevision
+			}
+			i.lastRevision.Store(resumeRevision)
 		}
 	}()
 

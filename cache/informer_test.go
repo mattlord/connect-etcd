@@ -144,11 +144,13 @@ func (f *fakeKVHandler) Range(ctx context.Context, req *connect.Request[etcdserv
 	return f.rangeFunc(ctx, req)
 }
 
-// TestInformerResyncsAfterCompaction ensures that when etcd has compacted the
-// revision that the watch would resume from, Run lists the keys again until a
-// list succeeds, sends the changes that it missed, and watches from the listed
-// revision.
-func TestInformerResyncsAfterCompaction(t *testing.T) {
+// TestInformerRun ensures that Run resumes its watch without missing changes.
+// When etcd has compacted the revision that the watch would resume from, Run
+// lists the keys again until a list succeeds, sends the changes that it
+// missed, and watches from the listed revision. When the watch's connection
+// drops partway through etcd's catch-up, Run watches from after the last event
+// that it received.
+func TestInformerRun(t *testing.T) {
 	t.Parallel()
 
 	kv := func(key string, modRevision int64) *mvccpb.KeyValue {
@@ -159,6 +161,14 @@ func TestInformerResyncsAfterCompaction(t *testing.T) {
 	// watch starts, it has missed an update to b, the deletion of c and the
 	// addition of d, and revision 18 has been compacted. The first list after
 	// that fails.
+	//
+	// Like etcd, it sends the changes after the list to a watch that is
+	// behind in batches, each with its current revision, 25. The connection
+	// of the first watch after the list drops after the first batch.
+	batches := [][]*mvccpb.Event{
+		{{Type: mvccpb.Event_PUT, Kv: kv("b", 21)}, {Type: mvccpb.Event_PUT, Kv: kv("d", 22)}},
+		{{Type: mvccpb.Event_DELETE, Kv: kv("a", 23)}},
+	}
 	var mu sync.Mutex
 	kvs := []*mvccpb.KeyValue{kv("a", 2), kv("b", 3), kv("c", 4)}
 	revision := int64(10)
@@ -189,7 +199,8 @@ func TestInformerResyncsAfterCompaction(t *testing.T) {
 
 			mu.Lock()
 			watchStarts = append(watchStarts, create.StartRevision)
-			if len(watchStarts) == 1 {
+			watches := len(watchStarts)
+			if watches == 1 {
 				kvs = []*mvccpb.KeyValue{kv("a", 2), kv("b", 15), kv("d", 16)}
 				revision = 20
 			}
@@ -204,23 +215,38 @@ func TestInformerResyncsAfterCompaction(t *testing.T) {
 				return err
 			}
 
-			resp := &etcdserverpb.WatchResponse{
-				WatchId: create.WatchId,
-				Header:  header,
-			}
 			if create.StartRevision < 18 {
 				// Like etcd, cancel the watch in a second message.
-				resp.Canceled = true
-				resp.CompactRevision = 18
-			} else {
-				resp.Header = &etcdserverpb.ResponseHeader{Revision: 22}
-				resp.Events = []*mvccpb.Event{
-					{Type: mvccpb.Event_PUT, Kv: kv("b", 21)},
-					{Type: mvccpb.Event_DELETE, Kv: kv("a", 22)},
+				if err := stream.Send(&etcdserverpb.WatchResponse{
+					WatchId:         create.WatchId,
+					Header:          header,
+					Canceled:        true,
+					CompactRevision: 18,
+				}); err != nil {
+					return err
 				}
-			}
-			if err := stream.Send(resp); err != nil {
-				return err
+			} else {
+				for _, batch := range batches {
+					var events []*mvccpb.Event
+					for _, ev := range batch {
+						if ev.Kv.ModRevision >= create.StartRevision {
+							events = append(events, ev)
+						}
+					}
+					if len(events) == 0 {
+						continue
+					}
+					if err := stream.Send(&etcdserverpb.WatchResponse{
+						WatchId: create.WatchId,
+						Header:  &etcdserverpb.ResponseHeader{Revision: 25},
+						Events:  events,
+					}); err != nil {
+						return err
+					}
+					if watches == 2 {
+						return connect.NewError(connect.CodeUnavailable, errors.New("connection lost"))
+					}
+				}
 			}
 
 			<-ctx.Done()
@@ -284,9 +310,9 @@ func TestInformerResyncsAfterCompaction(t *testing.T) {
 	want := [][]string{
 		{"add a@2", "add b@3", "add c@4"},
 		{"add d@16", "delete c@20", "update b@15"},
-		{"update b@21", "delete a@22"},
+		{"update b@21", "update d@22", "delete a@23"},
 	}
-	if len(events) != 8 {
+	if len(events) != 9 {
 		t.Fatalf("events = %q, want %q", events, want)
 	}
 	got := [][]string{events[:3], events[3:6], events[6:]}
@@ -303,11 +329,11 @@ func TestInformerResyncsAfterCompaction(t *testing.T) {
 	if rangeCalls != 3 {
 		t.Errorf("Range calls = %d, want 3", rangeCalls)
 	}
-	if want := []int64{11, 21}; !slices.Equal(watchStarts, want) {
+	if want := []int64{11, 21, 23}; !slices.Equal(watchStarts, want) {
 		t.Errorf("watch start revisions = %v, want %v", watchStarts, want)
 	}
 
-	for key, want := range map[string]int64{"a": 0, "b": 21, "c": 0, "d": 16} {
+	for key, want := range map[string]int64{"a": 0, "b": 21, "c": 0, "d": 22} {
 		kv, ok := inf.Get([]byte(key))
 		switch {
 		case want == 0 && ok:
