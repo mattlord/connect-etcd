@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,9 +151,10 @@ func (f *fakeKVHandler) Range(ctx context.Context, req *connect.Request[etcdserv
 // lists the keys again until a list succeeds, sends the changes that it
 // missed, and watches from the listed revision. When the watch's connection
 // drops partway through etcd's catch-up, Run watches from after the last event
-// that it received.
+// that it received. Once Run returns, its watch goroutine has exited.
 func TestInformerRun(t *testing.T) {
-	t.Parallel()
+	// Not parallel, so that no other test's watch goroutine is running
+	// when it checks that Run's has exited.
 
 	kv := func(key string, modRevision int64) *mvccpb.KeyValue {
 		return &mvccpb.KeyValue{Key: []byte(key), ModRevision: modRevision}
@@ -299,9 +302,26 @@ func TestInformerRun(t *testing.T) {
 		defer eventsMu.Unlock()
 		t.Fatalf("watch events never arrived (%v); events: %q", ctx.Err(), events)
 	}
+	watching := func() (bool, string) {
+		buf := make([]byte, 1<<20)
+		stacks := string(buf[:runtime.Stack(buf, true)])
+		return strings.Contains(stacks, "cache.(*Informer).stream"), stacks
+	}
+	if ok, stacks := watching(); !ok {
+		t.Fatalf("no watch goroutine found while Run is running:\n%s", stacks)
+	}
 	cancel()
 	if err := <-runErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+	}
+	for start := time.Now(); ; time.Sleep(10 * time.Millisecond) {
+		ok, stacks := watching()
+		if !ok {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatalf("watch goroutine still running after Run returned:\n%s", stacks)
+		}
 	}
 
 	eventsMu.Lock()

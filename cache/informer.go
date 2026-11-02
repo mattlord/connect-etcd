@@ -337,7 +337,10 @@ func (i *Informer) stream(ctx context.Context) error {
 	}
 	lastRevision := msg.Header.Revision
 
-	errCh := make(chan error)
+	// Buffer the error, so that the goroutine can exit after stream has
+	// returned because ctx is done. Its Receive returns once the deferred
+	// CloseRequest has run; canceling ctx alone doesn't end it.
+	errCh := make(chan error, 1)
 
 	go func() {
 		defer close(errCh)
