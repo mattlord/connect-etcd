@@ -23,6 +23,11 @@ type Informer struct {
 
 	ListPageSize int64
 
+	// AddFunc, UpdateFunc and DeleteFunc are called for each change to the
+	// cache, one at a time. The initial list's AddFunc calls are made once
+	// the whole list is in the cache, and before WaitForCacheSync returns.
+	// Every other call is made with the cache locked, so it must not call
+	// Get or List, and it holds up their callers until it returns.
 	AddFunc    func(*mvccpb.KeyValue)
 	UpdateFunc func(*mvccpb.KeyValue)
 	DeleteFunc func(*mvccpb.KeyValue)
@@ -188,15 +193,21 @@ func (i *Informer) load(ctx context.Context) error {
 		startKey = nextKey(msg.Kvs[len(msg.Kvs)-1].Key)
 	}
 
-	// Swap the caches and send out the differences under the lock, as the
-	// watch does, so that readers never see the new cache before the
-	// callbacks have.
 	i.cacheLock.Lock()
-	defer i.cacheLock.Unlock()
-
 	old := i.cache
 	i.cache = cache
 	i.lastRevision.Store(lastRevision)
+
+	// The initial list's AddFunc calls can read the cache, as they always
+	// could: nothing else calls back until the watch starts, after load
+	// returns. Later lists send out the differences under the lock, as the
+	// watch does, so that readers never see the new cache before the
+	// callbacks have.
+	if old == nil {
+		i.cacheLock.Unlock()
+	} else {
+		defer i.cacheLock.Unlock()
+	}
 
 	for key, kv := range cache {
 		prev, ok := old[key]

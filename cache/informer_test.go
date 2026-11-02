@@ -151,7 +151,9 @@ func (f *fakeKVHandler) Range(ctx context.Context, req *connect.Request[etcdserv
 // lists the keys again until a list succeeds, sends the changes that it
 // missed, and watches from the listed revision. When the watch's connection
 // drops partway through etcd's catch-up, Run watches from after the last event
-// that it received. Once Run returns, its watch goroutine has exited.
+// that it received. The initial list's AddFunc calls can read the cache, and
+// every later callback runs with it locked. Once Run returns, its watch
+// goroutine has exited.
 func TestInformerRun(t *testing.T) {
 	// Not parallel, so that no other test's watch goroutine is running
 	// when it checks that Run's has exited.
@@ -163,7 +165,8 @@ func TestInformerRun(t *testing.T) {
 	// The fake etcd plays out this history of keys a to d:
 	//
 	//  1. The first list, at revision 10, finds a@2, b@3 and c@4, so Run
-	//     adds all three and watches from 11.
+	//     adds all three, with the cache unlocked so that the callbacks can
+	//     read it, and watches from 11.
 	//  2. Before that watch starts, b is updated at 15, d is added at 16, c
 	//     is deleted at 17, and etcd compacts at revision 18. So etcd
 	//     cancels the watch, and Run lists the keys again.
@@ -283,20 +286,40 @@ func TestInformerRun(t *testing.T) {
 	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	t.Cleanup(srv.Close)
 
+	var inf *Informer
 	var eventsMu sync.Mutex
-	var events []string
+	var events, callbackErrs []string
 	deletedA := make(chan struct{})
 	record := func(op string) func(*mvccpb.KeyValue) {
 		return func(kv *mvccpb.KeyValue) {
+			event := fmt.Sprintf("%s %s@%d", op, kv.Key, kv.ModRevision)
+			// Step 1's callbacks, the only ones for revisions before the
+			// first list's 10, can read the cache, which already holds
+			// their keys. Every later callback runs with the cache locked.
+			// Check before taking eventsMu, so that a callback stuck on
+			// the cache lock doesn't keep the test from failing.
+			var callbackErr string
+			if kv.ModRevision < 10 {
+				if got, ok := inf.Get(kv.Key); !ok || got.ModRevision != kv.ModRevision {
+					callbackErr = fmt.Sprintf("%s: Get = %v, %v", event, got, ok)
+				}
+			} else if inf.cacheLock.TryRLock() {
+				inf.cacheLock.RUnlock()
+				callbackErr = event + ": called with the cache unlocked"
+			}
+
 			eventsMu.Lock()
 			defer eventsMu.Unlock()
-			events = append(events, fmt.Sprintf("%s %s@%d", op, kv.Key, kv.ModRevision))
+			events = append(events, event)
+			if callbackErr != "" {
+				callbackErrs = append(callbackErrs, callbackErr)
+			}
 			if op == "delete" && string(kv.Key) == "a" {
 				close(deletedA)
 			}
 		}
 	}
-	inf := &Informer{
+	inf = &Informer{
 		// Don't let the client retry step 3's failed list itself, so that
 		// Run sees the failure.
 		Client: etcd.NewClient(etcd.Config{
@@ -371,6 +394,9 @@ func TestInformerRun(t *testing.T) {
 		if !slices.Equal(got[n], want[n]) {
 			t.Fatalf("events = %q, want %q", got, want)
 		}
+	}
+	if len(callbackErrs) > 0 {
+		t.Errorf("callbacks: %q", callbackErrs)
 	}
 
 	mu.Lock()
